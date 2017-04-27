@@ -112,49 +112,60 @@ public class HgExe {
         // TODO might be more efficient to have a single call returning ArgumentListBuilder[2]?
         baseNoDebug = findHgExe(inst, credentials, node, listener, false);
         if (credentials instanceof SSHUserPrivateKey) {
+            FilePath slaveRoot = node.getRootPath();
+            if (slaveRoot == null) {
+                throw new IOException(node.getDisplayName() + " is offline");
+            }
             final SSHUserPrivateKey cc = (SSHUserPrivateKey) credentials;
             List<String> keys = cc.getPrivateKeys();
             byte[] keyData;
             if (keys.isEmpty()) {
                 throw new IOException("No private key available");
-            } else if (keys.size() > 1) {
-                throw new IOException("Multiple private keys found.");
-            } else {
-                keyData = keys.get(0).getBytes("US-ASCII");
             }
-            
             final Secret passphrase = cc.getPassphrase();
-            if (passphrase != null && /* TODO JENKINS-21283 */ passphrase.getPlainText().length() > 0) {
-                try {
-                    KeyPair kp = KeyPair.load(new JSch(), keyData, null);
-                    if (!kp.decrypt(passphrase.getPlainText())) {
-                        throw new IOException("Passphrase did not decrypt SSH private key");
+            boolean hasPassphrase =
+                (passphrase != null && /* TODO JENKINS-21283 */ passphrase.getPlainText().length() > 0);
+            IOException decryptFail = null;
+            do {
+                keyData = keys.get(i).getBytes("US-ASCII");
+
+                if (hasPassphrase) {
+                    try {
+                        KeyPair kp = KeyPair.load(new JSch(), keyData, null);
+                        if (!kp.decrypt(passphrase.getPlainText())) {
+                            decryptFail = new IOException("Passphrase did not decrypt SSH private key");
+                            break;
+                        }
+                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                        kp.writePrivateKey(baos);
+                        keyData = baos.toByteArray();
+                    } catch (JSchException x) {
+                        decryptFail = new IOException("Did not manage to decrypt SSH private key: " + x, x);
+                        break;
                     }
-                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                    kp.writePrivateKey(baos);
-                    keyData = baos.toByteArray();
-                } catch (JSchException x) {
-                    throw new IOException("Did not manage to decrypt SSH private key: " + x, x);
                 }
-            }
-            FilePath slaveRoot = node.getRootPath();
-            if (slaveRoot == null) {
-                throw new IOException(node.getDisplayName() + " is offline");
-            }
-            sshPrivateKey = slaveRoot.createTempFile("jenkins-mercurial", ".sshkey");
-            sshPrivateKey.chmod(0600);
-            // just in case slave goes offline during command; createTempFile fails to do it:
-            sshPrivateKey.act(new DeleteOnExit());
-            OutputStream os = sshPrivateKey.write();
-            try {
-                os.write(keyData);
-            } finally {
-                os.close();
+                sshPrivateKey = slaveRoot.createTempFile("jenkins-mercurial", ".sshkey");
+                sshPrivateKey.chmod(0600);
+                // just in case slave goes offline during command; createTempFile fails to do it:
+                sshPrivateKey.act(new DeleteOnExit());
+                OutputStream os = sshPrivateKey.write();
+                try {
+                    os.write(keyData);
+                } finally {
+                    os.close();
+                }
+            } while (false);
+            if (decryptFail) {
+                throw decryptFail;
             }
             for (ArgumentListBuilder b : new ArgumentListBuilder[] {base, baseNoDebug}) {
                 b.add("--config");
                 // TODO do we really want to pass -l username? Usually the username is ‘hg’ and encoded in the URL. But seems harmless at least on bitbucket.
-                b.addMasked(String.format("ui.ssh=ssh -i %s -l %s", sshPrivateKey.getRemote(), cc.getUsername()));
+                StringBuilder sshKeys = new StringBuilder();
+                if (sshPrivateKey != null) {
+                    sshKeys.append(String.format("-i %s", sshPrivateKey.getRemote()));
+                }
+                b.addMasked(String.format("ui.ssh=ssh %s -l %s", sshKeys.toString(), cc.getUsername()));
             }
         } else {
             sshPrivateKey = null;
